@@ -20,25 +20,36 @@ uint8_t mac[6];
     os_sprintf(config->ssid,"%s",       WIFI_SSID);
     os_sprintf(config->password,"%s",   WIFI_PASSWORD);
     config->auto_connect                = 1;
+    os_memset(config->bssid, 0, 6);
     os_sprintf(config->ap_ssid,"%s",    WIFI_AP_SSID);
     os_sprintf(config->ap_password,"%s",WIFI_AP_PASSWORD);
     config->ap_open			= 1;
     config->ap_on			= 1;
+    config->ssid_hidden			= 0;
     config->locked			= 0;
+    config->lock_password[0]		= '\0';
 
     IP4_ADDR(&config->network_addr, 192, 168, 4, 1);
     config->dns_addr.addr		= 0;  // use DHCP
     config->my_addr.addr		= 0;  // use DHCP   
     config->my_netmask.addr		= 0;  // use DHCP   
     config->my_gw.addr			= 0;  // use DHCP   
-
+#ifdef PHY_MODE
+    config->phy_mode			= 3;  // mode n
+#endif
     config->clock_speed			= 80;
+    config->status_led			= STATUS_LED_GIPO;
 #ifdef ALLOW_SLEEP
     config->Vmin			= 0;
     config->Vmin_sleep			= 60;
 #endif
+#ifdef REMOTE_CONFIG
     config->config_port			= CONSOLE_SERVER_PORT;
-
+#endif
+#ifdef WEB_CONFIG
+    config->web_port			= WEB_CONFIG_PORT;
+#endif
+    config->config_access		= LOCAL_ACCESS | REMOTE_ACCESS;
 #ifdef TOKENBUCKET
     config->kbps_ds			= 0;
     config->kbps_us			= 0;
@@ -50,7 +61,7 @@ uint8_t mac[6];
     os_sprintf(config->mqtt_user,"%s", "none");
     config->mqtt_password[0]		= 0;
     wifi_get_macaddr(0, mac);
-    os_sprintf(config->mqtt_id,"%s_%2x%2x%2x", MQTT_ID, mac[3], mac[4], mac[5]);
+    os_sprintf(config->mqtt_id,"%s_%02x%02x%02x", MQTT_ID, mac[3], mac[4], mac[5]);
     os_sprintf(config->mqtt_prefix,"%s/%s/system", MQTT_PREFIX, config->mqtt_id);
     os_sprintf(config->mqtt_command_topic,"%s/%s/%s", MQTT_PREFIX, config->mqtt_id, "command");
     os_sprintf(config->mqtt_gpio_out_topic,"%s/%s/%s", MQTT_PREFIX, config->mqtt_id, "switch");

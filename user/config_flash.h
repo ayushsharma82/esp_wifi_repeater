@@ -30,21 +30,27 @@ typedef struct
     uint8_t     ssid[32];       // SSID of the AP to connect to
     uint8_t     password[64];   // Password of the network
     uint8_t     auto_connect;   // Should we auto connect
+    uint8_t     bssid[6];	// Optional: BSSID the AP
 
     uint8_t     ap_ssid[32];       // SSID of the own AP
     uint8_t     ap_password[64];   // Password of the own network
     uint8_t     ap_open;           // Should we use no WPA?
     uint8_t	ap_on;		   // AP enabled?
+    uint8_t	ssid_hidden;	   // Hidden SSID?
 
     uint8_t     locked;		// Should we allow for config changes
+    uint8_t     lock_password[32];   // Password of config lock
     ip_addr_t	network_addr;	// Address of the internal network
     ip_addr_t	dns_addr;	// Optional: address of the dns server
 
     ip_addr_t	my_addr;	// Optional (if not DHCP): IP address of the uplink side
     ip_addr_t	my_netmask;	// Optional (if not DHCP): IP netmask of the uplink side
     ip_addr_t	my_gw;		// Optional (if not DHCP): Gateway of the uplink side
-
+#ifdef PHY_MODE
+    uint16_t	phy_mode;	// WiFi PHY mode
+#endif
     uint16_t	clock_speed;	// Freq of the CPU
+    uint16_t	status_led;	// GPIO pin os the status LED (>16 disabled)
 
 #ifdef ALLOW_SLEEP
     int32_t	Vmin;		// Min voltage of battery
@@ -53,6 +59,10 @@ typedef struct
 #ifdef REMOTE_CONFIG
     uint16_t	config_port;	// Port on which the concole listenes (0 if no access)
 #endif
+#ifdef WEB_CONFIG
+    uint16_t	web_port;	// Port on which the concole listenes (0 if no access)
+#endif
+    uint8_t	config_access;	// Controls the interfaces that allow config access (default LOCAL_ACCESS | REMOTE_ACCESS)
 #ifdef TOKENBUCKET
     uint32_t 	kbps_ds;	// Average downstream bitrate (0 if no limit);
     uint32_t 	kbps_us;	// Average upstream bitrate (0 if no limit);

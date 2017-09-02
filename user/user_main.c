@@ -23,6 +23,10 @@
 
 #include "easygpio.h"
 
+#ifdef WEB_CONFIG
+#include "web.h"
+#endif
+
 #ifdef ACLS
 #include "acl.h"
 #endif
@@ -75,6 +79,10 @@ uint8_t remote_console_disconnect;
 void ICACHE_FLASH_ATTR user_set_softap_wifi_config(void);
 void ICACHE_FLASH_ATTR user_set_softap_ip_config(void);
 
+void ICACHE_FLASH_ATTR to_console(char *str) {
+    ringbuf_memcpy_into(console_tx_buffer, str, os_strlen(str));
+}
+
 #ifdef MQTT_CLIENT
 
 #define MQTT_TOPIC_RESPONSE	0x0001
@@ -95,7 +103,7 @@ void ICACHE_FLASH_ATTR user_set_softap_ip_config(void);
 #define MQTT_TOPIC_GPIOOUT	0x8000
 
 MQTT_Client mqttClient;
-bool mqtt_enabled;
+bool mqtt_enabled, mqtt_connected;
 
 void ICACHE_FLASH_ATTR mqtt_publish_str(uint16_t mask, uint8_t *sub_topic, uint8_t *str)
 {
@@ -104,7 +112,7 @@ uint8_t buf[256];
 
   os_sprintf(buf, "%s/%s", config.mqtt_prefix, sub_topic);
 //os_printf("Publish: %s %s\r\n", buf, str);
-  MQTT_Publish(&mqttClient, buf, str, os_strlen(str), 2, 0);
+  MQTT_Publish(&mqttClient, buf, str, os_strlen(str), 0, 0);
 }
 
 void ICACHE_FLASH_ATTR mqtt_publish_int(uint16_t mask, uint8_t *sub_topic, uint8_t *format, uint32_t val)
@@ -122,6 +130,7 @@ uint8_t ip_str[16];
 
   MQTT_Client* client = (MQTT_Client*)args;
   os_printf("MQTT: Connected\r\n");
+  mqtt_connected = true;
 
   os_sprintf(ip_str, IPSTR, IP2STR(&my_ip));
   mqtt_publish_str(MQTT_TOPIC_IP, "IP", ip_str);
@@ -140,6 +149,7 @@ static void ICACHE_FLASH_ATTR mqttDisconnectedCb(uint32_t *args)
 {
   MQTT_Client* client = (MQTT_Client*)args;
   os_printf("MQTT: Disconnected\r\n");
+  mqtt_connected = false;
 }
 
 static void ICACHE_FLASH_ATTR mqttPublishedCb(uint32_t *args)
@@ -323,9 +333,8 @@ err_t ICACHE_FLASH_ATTR my_input_ap (struct pbuf *p, struct netif *inp) {
 
 //  os_printf("Got packet from STA\r\n");
 
-#ifdef STATUS_LED_GIPO
-    GPIO_OUTPUT_SET (STATUS_LED_GIPO, 1);
-#endif
+    if (config.status_led <= 16)
+	GPIO_OUTPUT_SET (config.status_led, 1);
 
 #ifdef ACLS
     // Check ACLs - store result
@@ -384,9 +393,8 @@ err_t ICACHE_FLASH_ATTR my_output_ap (struct netif *outp, struct pbuf *p) {
 
 //  os_printf("Send packet to STA\r\n");
 
-#ifdef STATUS_LED_GIPO
-    GPIO_OUTPUT_SET (STATUS_LED_GIPO, 0);
-#endif
+    if (config.status_led <= 16)
+	GPIO_OUTPUT_SET (config.status_led, 0);
 
 #ifdef ACLS
     // Check ACLs - store result
@@ -466,39 +474,53 @@ ip_addr_t ap_ip;
 }
 
 
-int parse_str_into_tokens(char *str, char **tokens, int max_tokens)
+int ICACHE_FLASH_ATTR parse_str_into_tokens(char *str, char **tokens, int max_tokens)
 {
-char    *p, *q;
+char    *p, *q, *end;
 int     token_count = 0;
 bool    in_token = false;
 
    // preprocessing
    for (p = q = str; *p != 0; p++) {
-	if (*p == '\\') {
-	   // next char is quoted, copy it skip, this one
-	   if (*(p+1) != 0) *q++ = *++p;
+	if (*(p) == '%' && *(p+1) != 0 && *(p+2) != 0) {
+	   // quoted hex
+		uint8_t a;
+		p++;
+		if (*p <= '9')
+		    a = *p - '0';
+		else
+		    a = toupper(*p) - 'A' + 10;
+		a <<= 4;
+		p++;
+		if (*p <= '9')
+		    a += *p - '0';
+		else
+		    a += toupper(*p) - 'A' + 10;
+		*q++ = a;
+	} else if (*p == '\\' && *(p+1) != 0) {
+	   // next char is quoted - just copy it, skip this one
+	   *q++ = *++p;
 	} else if (*p == 8) {
 	   // backspace - delete previous char
 	   if (q != str) q--;
 	} else if (*p <= ' ') {
 	   // mark this as whitespace
-	   *q++ = 1;
+	   *q++ = 0;
 	} else {
 	   *q++ = *p;
 	}
    }
 
+   end = q;
    *q = 0;
 
    // cut into tokens
-   for (p = str; *p != 0; p++) {
-	if (*p == 1) {
+   for (p = str; p != end; p++) {
+	if (*p == 0) {
 	   if (in_token) {
-		*p = 0;
 		in_token = false;
 	   }
 	} else {
-	   if (*p & 0x80) *p &= 0x7f;
 	   if (!in_token) {
 		tokens[token_count++] = p;
 		if (token_count == max_tokens)
@@ -548,7 +570,7 @@ void ICACHE_FLASH_ATTR scan_done(void *arg, STATUS status)
       os_sprintf(response, "%d,\"%s\",%d,\""MACSTR"\",%d\r\n",
                  bss_link->authmode, bss_link->ssid, bss_link->rssi,
                  MAC2STR(bss_link->bssid),bss_link->channel);
-      ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+      to_console(response);
 #ifdef MQTT_CLIENT
       mqtt_publish_str(MQTT_TOPIC_SCANRESULT, "ScanResult", response);
 #endif
@@ -558,7 +580,7 @@ void ICACHE_FLASH_ATTR scan_done(void *arg, STATUS status)
   else
   {
      os_sprintf(response, "scan fail !!!\r\n");
-     ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+     to_console(response);
   }
   system_os_post(0, SIG_CONSOLE_TX, (ETSParam) scanconn);
 }
@@ -607,7 +629,7 @@ char response[128];
     mqtt_publish_str(MQTT_TOPIC_ACLDENY, "ACLDeny", response);
 #endif
     if (acl_debug) {
-	ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+	to_console(response);
 	system_os_post(0, SIG_CONSOLE_TX, (ETSParam) deny_cb_conn);
     }
     return allow;
@@ -662,38 +684,49 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
 
     if (strcmp(tokens[0], "help") == 0)
     {
-        os_sprintf(response, "show [config|stats%s]\r\n|set [ssid|password|auto_connect|ap_ssid|ap_password|network|dns|ip|netmask|gw|ap_mac|sta_mac|ap_on|ap_open|vmin|vmin_sleep|speed|config_port] <val>\r\n|portmap [add|remove] [TCP|UDP] <ext_port> <int_addr> <int_port>\r\n|quit|save [config|dhcp]|reset [factory]|lock|unlock <password>",
+        os_sprintf(response, "show [config|stats%s]\r\n",
 #ifdef MQTT_CLIENT
 		"|mqtt"
 #else
 		""
 #endif
 	);
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        to_console(response);
+
+        os_sprintf(response, "set [ssid|password|auto_connect|ap_ssid|ap_password|ap_on|ap_open|ap_mac|sta_mac|ssid_hidden] <val>\r\nset [network|dns|ip|netmask|gw] <val>\r\n");
+        to_console(response);
+
+        os_sprintf(response, "set [speed|status_led|config_port|config_access|web_port] <val>\r\nportmap [add|remove] [TCP|UDP] <ext_port> <int_addr> <int_port>\r\nsave [config|dhcp]\r\nreset [factory] | lock | unlock <password> | quit\r\n");
+        to_console(response);
+
 #ifdef ALLOW_SCANNING
-        os_sprintf(response, "|scan");
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        os_sprintf(response, "scan\r\n");
+        to_console(response);
+#endif
+#ifdef PHY_MODE
+        os_sprintf(response, "set phy_mode [1|2|3]\r\n");
+        to_console(response);
 #endif
 #ifdef ALLOW_SLEEP
-        os_sprintf(response, "|sleep");
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        os_sprintf(response, "sleep\r\nset [vmin|vmin_sleep] <val>\r\n");
+        to_console(response);
 #endif
 #ifdef REMOTE_MONITORING
-        os_sprintf(response, "|monitor [on|off] <portnumber>");
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        os_sprintf(response, "monitor [on|off] <portnumber>\r\n");
+        to_console(response);
 #endif
-	ringbuf_memcpy_into(console_tx_buffer, "\r\n", 2);
+
 #ifdef TOKENBUCKET
-        os_sprintf(response, "|set [upstream_kbps|downstream_kbps] <val>\r\n");
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        os_sprintf(response, "set [upstream_kbps|downstream_kbps] <val>\r\n");
+        to_console(response);
 #endif
 #ifdef ACLS
-        os_sprintf(response, "|acl [from_sta|to_sta] clear\r\n|acl [from_sta|to_sta] [IP|TCP|UDP] <src_addr> [<src_port>] <dest_addr> [<dest_port>] [allow|deny|allow_monitor|deny_monitor]\r\n");
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        os_sprintf(response, "acl [from_sta|to_sta] clear\r\nacl [from_sta|to_sta] [IP|TCP|UDP] <src_addr> [<src_port>] <dest_addr> [<dest_port>] [allow|deny|allow_monitor|deny_monitor]\r\n");
+        to_console(response);
 #endif
 #ifdef MQTT_CLIENT
-        os_sprintf(response, "|set [mqtt_host|mqtt_port|mqtt_user|mqtt_password|mqtt_id|mqtt_prefix|mqtt_command_topic|mqtt_interval] <val>\r\n");
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        os_sprintf(response, "set [mqtt_host|mqtt_port|mqtt_user|mqtt_password|mqtt_id|mqtt_prefix|mqtt_command_topic|mqtt_interval] <val>\r\n");
+        to_console(response);
 #endif
         goto command_handled_2;
     }
@@ -709,50 +742,65 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
                    config.ssid,
                    config.locked?"***":(char*)config.password,
                    config.auto_connect?"":" [AutoConnect:0]");
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
-
-        os_sprintf(response, "AP:  SSID:%s PW:%s%s%s IP:%d.%d.%d.%d/24",
+        to_console(response);
+	if (*(int*)config.bssid != 0) {
+		os_sprintf(response, "BSSID: %02x:%02x:%02x:%02x:%02x:%02x\r\n", 
+		    config.bssid[0], config.bssid[1], config.bssid[2],
+		    config.bssid[3], config.bssid[4], config.bssid[5]);
+		to_console(response);
+	}
+        os_sprintf(response, "AP:  SSID:%s %s PW:%s%s%s IP:%d.%d.%d.%d/24",
                    config.ap_ssid,
+		   config.ssid_hidden?"[hidden]":"",
                    config.locked?"***":(char*)config.ap_password,
                    config.ap_open?" [open]":"",
                    config.ap_on?"":" [disabled]",
 		   IP2STR(&config.network_addr));
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        to_console(response);
 	// if static DNS, add it
 	os_sprintf(response, config.dns_addr.addr?" DNS: %d.%d.%d.%d\r\n":"\r\n", IP2STR(&config.dns_addr));
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        to_console(response);
 	// if static IP, add it
 	os_sprintf(response, config.my_addr.addr?"Static IP: %d.%d.%d.%d Netmask: %d.%d.%d.%d Gateway: %d.%d.%d.%d\r\n":"", 
 		IP2STR(&config.my_addr), IP2STR(&config.my_netmask), IP2STR(&config.my_gw));
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        to_console(response);
 
 	os_sprintf(response, "STA MAC: %02x:%02x:%02x:%02x:%02x:%02x\r\nAP MAC:  %02x:%02x:%02x:%02x:%02x:%02x\r\n",  
 		   config.STA_MAC_address[0], config.STA_MAC_address[1], config.STA_MAC_address[2],
 		   config.STA_MAC_address[3], config.STA_MAC_address[4], config.STA_MAC_address[5],
 		   config.AP_MAC_address[0], config.AP_MAC_address[1], config.AP_MAC_address[2],
 		   config.AP_MAC_address[3], config.AP_MAC_address[4], config.AP_MAC_address[5]);
-	ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+	to_console(response);
+
+#ifdef REMOTE_CONFIG
+	if (config.config_port == 0 || config.config_access == 0) {
+		os_sprintf(response, "No network console access\r\n");
+	} else {
+		os_sprintf(response, "Network console access on port %d (mode %d)\r\n", config.config_port, config.config_access);
+	}
+	to_console(response);
+#endif
 
         os_sprintf(response, "Clock speed: %d\r\n", config.clock_speed);
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        to_console(response);
 #ifdef TOKENBUCKET
 	if (config.kbps_ds != 0) {
             os_sprintf(response, "Downstream limit: %d kbps\r\n", config.kbps_ds);
-            ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+            to_console(response);
 	}
 	if (config.kbps_us != 0) {
             os_sprintf(response, "Upstream limit: %d kbps\r\n", config.kbps_us);
-            ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+            to_console(response);
 	}
 #endif
 #ifdef MQTT_CLIENT
         os_sprintf(response, "MQTT: %s\r\n", mqtt_enabled?"enabled":"disabled");
-        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));      
+        to_console(response);      
 #endif
 #ifdef ALLOW_SLEEP
 	if (config.Vmin != 0) {
             os_sprintf(response, "Vmin: %d mV Sleep time: %d s\r\n", config.Vmin, config.Vmin_sleep);
-            ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+            to_console(response);
 	}
 #endif
 	for (i = 0; i<IP_PORTMAP_MAX; i++) {
@@ -762,13 +810,13 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
 		os_sprintf(response, "Portmap: %s: " IPSTR ":%d -> "  IPSTR ":%d\r\n", 
 		   p->proto==IP_PROTO_TCP?"TCP":p->proto==IP_PROTO_UDP?"UDP":"???",
 		   IP2STR(&my_ip), ntohs(p->mport), IP2STR(&i_ip), ntohs(p->dport));
-		ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+		to_console(response);
 	    }
 	}
 #ifdef REMOTE_MONITORING
 	if (!config.locked&&monitor_port != 0) {
            	os_sprintf(response, "Monitor (mode %s) started on port %d\r\n", acl_monitoring?"acl":"all", monitor_port);
-		ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+		to_console(response);
 	}
 #endif
 	goto command_handled_2;
@@ -777,35 +825,42 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
       if (nTokens == 2 && strcmp(tokens[1], "stats") == 0) {
            uint32_t time = (uint32_t)(get_long_systime()/1000000);
 	   int16_t i;
+	   enum phy_mode phy;
 	   struct dhcps_pool *p;
 
            os_sprintf(response, "System uptime: %d:%02d:%02d\r\nPower supply: %d.%03d V\r\n", 
 	      time/3600, (time%3600)/60, time%60, Vdd/1000, Vdd%1000);
-	   ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+	   to_console(response);
 #ifdef USER_GPIO_OUT
 	   os_sprintf(response, "GPIO output status: %d\r\n", config.gpio_out_status);
-           ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+           to_console(response);
 #endif
 	   os_sprintf(response, "%d KiB in (%d packets)\r\n%d KiB out (%d packets)\r\n", 
 			(uint32_t)(Bytes_in/1024), Packets_in, 
 			(uint32_t)(Bytes_out/1024), Packets_out);
-           ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+           to_console(response);
+#ifdef PHY_MODE
+	   phy = wifi_get_phy_mode();
+	   os_sprintf(response, "Phy mode: %c\r\n", phy == PHY_MODE_11B?'b':phy == PHY_MODE_11G?'g':'n');
+           to_console(response);
+#endif
 	   if (connected) {
 		os_sprintf(response, "External IP-address: " IPSTR "\r\n", IP2STR(&my_ip));
 	   } else {
 		os_sprintf(response, "Not connected to AP\r\n");
 	   }
-	   ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+	   to_console(response);
 	   if (config.ap_on)
-		   os_sprintf(response, "%d Stations connected\r\n", wifi_softap_get_station_num());
+		os_sprintf(response, "%d Station%s connected to AP\r\n", wifi_softap_get_station_num(),
+		  wifi_softap_get_station_num()==1?"":"s");
 	   else
-		   os_sprintf(response, "AP disabled\r\n");
-           ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+		os_sprintf(response, "AP disabled\r\n");
+           to_console(response);
            for (i = 0; p = dhcps_get_mapping(i); i++) {
 		os_sprintf(response, "Station: %02x:%02x:%02x:%02x:%02x:%02x - "  IPSTR "\r\n", 
 		   p->mac[0], p->mac[1], p->mac[2], p->mac[3], p->mac[4], p->mac[5], 
 		   IP2STR(&p->ip));
-		ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+		to_console(response);
 	   }
 	   goto command_handled_2;
       }
@@ -814,16 +869,16 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
 	   if (!acl_is_empty(0)) {
 		ringbuf_memcpy_into(console_tx_buffer, "From STA:\r\n", 11);
 		acl_show(0, response);
-		ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+		to_console(response);
 	   }
 	   if (!acl_is_empty(1)) {
 		ringbuf_memcpy_into(console_tx_buffer, "To STA:\r\n", 9);
 		acl_show(1, response);
-		ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+		to_console(response);
 	   }
 	   os_sprintf(response, "Packets denied: %d Packets allowed: %d\r\n", 
 			acl_deny_count, acl_allow_count);
-	   ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+	   to_console(response);
 	   goto command_handled_2;
       }
 #endif
@@ -831,16 +886,17 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
       if (nTokens == 2 && strcmp(tokens[1], "mqtt") == 0) {
 	   if (os_strcmp(config.mqtt_host, "none") == 0) {
 	     os_sprintf(response, "MQTT not enabled (no mqtt_host)\r\n");
-	     ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+	     to_console(response);
 	     goto command_handled_2;
 	   }
+	   os_sprintf(response, "MQTT client %s\r\n", mqtt_connected ? "connected" : "disconnected");
+	   to_console(response);
            os_sprintf(response, "MQTT host: %s\r\nMQTT port: %d\r\nMQTT user: %s\r\nMQTT password: %s\r\n",
 		config.mqtt_host, config.mqtt_port, config.mqtt_user, config.locked?"***":(char*)config.mqtt_password);
-	   ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+	   to_console(response);
            os_sprintf(response, "MQTT id: %s\r\nMQTT prefix: %s\r\nMQTT command topic: %s\r\nMQTT gpio_out topic: %s\r\nMQTT interval: %d s\r\nMQTT mask: %04x\r\n",
 		config.mqtt_id, config.mqtt_prefix, config.mqtt_command_topic, config.mqtt_gpio_out_topic, config.mqtt_interval, config.mqtt_topic_mask);
-	   ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
-
+	   to_console(response);
 	   goto command_handled_2;
       }
 #endif
@@ -1026,8 +1082,11 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
         goto command_handled;
     }
 #endif
-    if (strcmp(tokens[0], "reset") == 0)
-    {
+    if (strcmp(tokens[0], "reset") == 0) {
+	if (config.locked && pespconn != NULL) {
+	    os_sprintf(response, INVALID_LOCKED);
+	    goto command_handled;
+	}
 	if (nTokens == 2 && strcmp(tokens[1], "factory") == 0) {
            config_load_default(&config);
            config_save(&config);
@@ -1059,25 +1118,41 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
         goto command_handled;
     }
 #endif
-    if (strcmp(tokens[0], "lock") == 0)
-    {
+    if (strcmp(tokens[0], "lock") == 0) {
+	if (config.locked) {
+	    os_sprintf(response, "Config already locked\r\n");
+	    goto command_handled;
+	}
+	if (nTokens == 1) {
+	    if (os_strlen(config.lock_password) == 0) {
+		os_sprintf(response, "No password defined\r\n");
+		goto command_handled;
+	    }
+	}
+	else if (nTokens == 2) {
+	    os_sprintf(config.lock_password, "%s", tokens[1]);
+	}
+	else {
+	    os_sprintf(response, INVALID_NUMARGS);
+	    goto command_handled;
+	}
 	config.locked = 1;
-	os_sprintf(response, "Config locked\r\n");
-        goto command_handled;
+	config_save(&config);
+	os_sprintf(response, "Config locked (pw: %s)\r\n", config.lock_password);
+	goto command_handled;
     }
 
-    if (strcmp(tokens[0], "unlock") == 0)
-    {
-        if (nTokens != 2) {
-            os_sprintf(response, INVALID_NUMARGS);
-        }
-        else if (strcmp(tokens[1],config.password) == 0) {
+    if (strcmp(tokens[0], "unlock") == 0) {
+	if (nTokens != 2) {
+	    os_sprintf(response, INVALID_NUMARGS);
+	} else if (os_strcmp(tokens[1], config.lock_password) == 0) {
 	    config.locked = 0;
+	    config_save(&config);
 	    os_sprintf(response, "Config unlocked\r\n");
-        } else {
+	} else {
 	    os_sprintf(response, "Unlock failed. Invalid password\r\n");
-        }
-        goto command_handled;
+	}
+	goto command_handled;
     }
 
 #ifdef REMOTE_MONITORING
@@ -1161,6 +1236,10 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
             if (strcmp(tokens[1],"password") == 0)
             {
                 os_sprintf(config.password, "%s", tokens[2]);
+
+		// WiFi pw of the uplink network is also the default lock pw (backward compatibility)
+		os_sprintf(config.lock_password, "%s", tokens[2]);
+
                 os_sprintf(response, "Password set\r\n");
                 goto command_handled;
             }
@@ -1197,6 +1276,12 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
                 os_sprintf(response, "Open Auth set\r\n");
                 goto command_handled;
             }
+            if (strcmp(tokens[1],"ssid_hidden") == 0)
+            {
+                config.ssid_hidden = atoi(tokens[2]);
+                os_sprintf(response, "Hidden SSID set\r\n");
+                goto command_handled;
+            }
 #ifdef ACLS
             if (strcmp(tokens[1],"acl_debug") == 0)
             {
@@ -1213,6 +1298,26 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
 		  os_sprintf(response, "WARNING: if you save this, remote console access will be disabled!\r\n");
 		else
 		  os_sprintf(response, "Config port set to %d\r\n", config.config_port);
+                goto command_handled;
+            }
+#endif
+	    if (strcmp(tokens[1], "config_access") == 0) {
+		config.config_access = atoi(tokens[2]) & (LOCAL_ACCESS | REMOTE_ACCESS);
+		if (config.config_access == 0)
+		    os_sprintf(response, "WARNING: if you save this, remote console and web access will be disabled!\r\n");
+		else
+		    os_sprintf(response, "Config access set\r\n", config.config_port);
+		goto command_handled;
+	    }
+
+#ifdef WEB_CONFIG
+            if (strcmp(tokens[1],"web_port") == 0)
+            {
+                config.web_port = atoi(tokens[2]);
+		if (config.web_port == 0) 
+		  os_sprintf(response, "WARNING: if you save this, web config will be disabled!\r\n");
+		else
+		  os_sprintf(response, "Web port set to %d\r\n", config.web_port);
                 goto command_handled;
             }
 #endif
@@ -1281,6 +1386,41 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
         	goto command_handled;
 	    }
 
+	    if (strcmp(tokens[1], "status_led") == 0)
+	    {
+	    	if (config.status_led <= 16) {
+		    GPIO_OUTPUT_SET (config.status_led, 1);
+		}
+		if (config.status_led == 1) {
+		    // Enable output if serial pin was used as status LED
+		    system_set_os_print(1);
+		}
+		config.status_led = atoi(tokens[2]);
+		if (config.status_led > 16) {
+		    os_sprintf(response, "Status led disabled\r\n");
+		    goto command_handled;
+		}
+		if (config.status_led == 1) {
+		    // Disable output if serial pin is used as status LED
+		    system_set_os_print(0);
+		}
+		easygpio_pinMode(config.status_led, EASYGPIO_NOPULL, EASYGPIO_OUTPUT);
+		GPIO_OUTPUT_SET (config.status_led, 0);
+		os_sprintf(response, "Status led set to GPIO %d\r\n", config.status_led);
+        	goto command_handled;
+	    }
+#ifdef PHY_MODE
+	    if (strcmp(tokens[1], "phy_mode") == 0)
+	    {
+		uint16_t mode = atoi(tokens[2]);
+		bool succ = wifi_set_phy_mode(mode);
+		if (succ) 
+		    config.phy_mode = mode;
+		os_sprintf(response, "Phy mode setting %s\r\n",
+		  succ?"successful":"failed");
+        	goto command_handled;
+	    }
+#endif
             if (strcmp(tokens[1],"network") == 0)
             {
                 config.network_addr.addr = ipaddr_addr(tokens[2]);
@@ -1351,6 +1491,15 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
 		  os_sprintf(response, INVALID_ARG);
 		else
                   os_sprintf(response, "STA MAC set\r\n");
+                goto command_handled;
+            }
+
+            if (strcmp(tokens[1],"bssid") == 0)
+            {
+                if (!parse_mac(config.bssid, tokens[2]))
+		  os_sprintf(response, INVALID_ARG);
+		else
+                  os_sprintf(response, "bssid set\r\n");
                 goto command_handled;
             }
 
@@ -1456,10 +1605,27 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
     os_sprintf(response, "\r\nInvalid Command\r\n");
 
 command_handled:
-    ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+    to_console(response);
 command_handled_2:
     system_os_post(0, SIG_CONSOLE_TX, (ETSParam) pespconn);
     return;
+}
+
+bool ICACHE_FLASH_ATTR check_connection_access(struct espconn *pesp_conn, uint8_t access_flags) {
+    remot_info *premot = NULL;
+    ip_addr_t *remote_addr;
+    bool is_local;
+
+    remote_addr = (ip_addr_t *)&(pesp_conn->proto.tcp->remote_ip);
+    //os_printf("Remote addr is %d.%d.%d.%d\r\n", IP2STR(remote_addr));
+    is_local = (remote_addr->addr & 0x00ffffff) == (config.network_addr.addr & 0x00ffffff);
+
+    if (is_local && (access_flags & LOCAL_ACCESS))
+	return true;
+    if (!is_local && (access_flags & REMOTE_ACCESS))
+	return true;
+
+    return false;
 }
 
 #ifdef REMOTE_CONFIG
@@ -1505,6 +1671,12 @@ static void ICACHE_FLASH_ATTR tcp_client_connected_cb(void *arg)
 
     os_printf("tcp_client_connected_cb(): Client connected\r\n");
 
+    if (!check_connection_access(pespconn, config.config_access)) {
+	os_printf("Client disconnected - no config access on this network\r\n");
+	espconn_disconnect(pespconn);
+	return;
+    }
+
     //espconn_regist_sentcb(pespconn,     tcp_client_sent_cb);
     espconn_regist_disconcb(pespconn,   tcp_client_discon_cb);
     espconn_regist_recvcb(pespconn,     tcp_client_recv_cb);
@@ -1522,6 +1694,176 @@ static void ICACHE_FLASH_ATTR tcp_client_connected_cb(void *arg)
 #endif /* REMOTE_CONFIG */
 
 
+#ifdef WEB_CONFIG
+static char *page_buf = NULL;
+
+static void ICACHE_FLASH_ATTR handle_set_cmd(void *arg, char *cmd, char* val)
+{
+    struct espconn *pespconn = (struct espconn *)arg;
+    int max_current_cmd_size = MAX_CON_CMD_SIZE - (os_strlen(cmd)+1);
+    char cmd_line[MAX_CON_CMD_SIZE+1];
+
+    if (os_strlen(val) >= max_current_cmd_size)
+    {
+        val[max_current_cmd_size]='\0';
+    }
+    os_sprintf(cmd_line, "%s %s", cmd, val);
+    os_printf("web_config_client_recv_cb(): cmd line:%s\n",cmd_line);
+
+    ringbuf_memcpy_into(console_rx_buffer, cmd_line, os_strlen(cmd_line));
+    console_handle_command(pespconn);
+//    ringbuf_memcpy_into(console_rx_buffer, "save", os_strlen("save"));
+//    console_handle_command(pespconn);
+}
+
+char *strstr(char *string, char *needle);
+char *strtok ( char * str, const char * delimiters );
+char *strtok_r(char *s, const char *delim, char **last);
+
+static void ICACHE_FLASH_ATTR web_config_client_recv_cb(void *arg,
+                                                 char *data,
+                                                 unsigned short length)
+{
+    struct espconn *pespconn = (struct espconn *)arg;
+    char *kv, *sv;
+    bool do_reset = false;
+
+    char *str = strstr(data, " /?");
+    if (str != NULL)
+    {
+        str = strtok(str+3," ");
+
+        char* keyval = strtok_r(str,"&",&kv);
+        while (keyval != NULL)
+        {
+            char *key = strtok_r(keyval,"=", &sv);
+            char *val = strtok_r(NULL, "=", &sv);
+
+            keyval = strtok_r (NULL, "&", &kv);
+            os_printf("web_config_client_recv_cb(): key:%s:val:%s:\n",key,val);
+            if (val != NULL)
+            {
+
+                if (strcmp(key, "ssid") == 0)
+                {
+                    handle_set_cmd(pespconn, "set ssid", val);
+                    do_reset = true;
+                }
+                else if (strcmp(key, "password") == 0)
+                {
+                    handle_set_cmd(pespconn, "set password", val);
+                    do_reset = true;
+                }
+                else if (strcmp(key, "lock") == 0)
+                {
+                    config.locked = 1;
+                }
+                else if (strcmp(key, "ap_ssid") == 0)
+                {
+                    handle_set_cmd(pespconn, "set ap_ssid", val);
+                    do_reset = true;
+                }
+                else if (strcmp(key, "ap_password") == 0)
+                {
+                    handle_set_cmd(pespconn, "set ap_password", val);
+                    do_reset = true;
+                }
+                else if (strcmp(key, "network") == 0)
+                {
+                    handle_set_cmd(pespconn, "set network", val);
+                    do_reset = true;
+                }
+                else if (strcmp(key, "unlock_password") == 0)
+                {
+                    handle_set_cmd(pespconn, "unlock", val);
+                }
+                else if (strcmp(key, "ap_open") == 0)
+                {
+                    if (strcmp(val, "wpa2") == 0)
+                    {
+                        config.ap_open = 0;
+                        do_reset = true;
+                    }
+                    if (strcmp(val, "open") == 0)
+                    {
+                        config.ap_open = 1;
+                        do_reset = true;
+                    }                }
+                else if (strcmp(key, "reset") == 0)
+                {
+                    do_reset = true;
+                }
+            }
+        }
+
+	config_save(&config);
+
+        if (do_reset == true)
+        {
+            do_reset = false;
+            ringbuf_memcpy_into(console_rx_buffer, "reset", os_strlen("reset"));
+            console_handle_command(pespconn);
+        }
+    }
+}
+
+static void ICACHE_FLASH_ATTR web_config_client_discon_cb(void *arg)
+{
+    os_printf("web_config_client_discon_cb(): client disconnected\n");
+    struct espconn *pespconn = (struct espconn *)arg;
+
+    if (page_buf != NULL)
+	os_free(page_buf);
+    page_buf = NULL;
+}
+
+static void ICACHE_FLASH_ATTR web_config_client_sent_cb(void *arg)
+{
+    os_printf("web_config_client_discon_cb(): data sent to client\n");
+    struct espconn *pespconn = (struct espconn *)arg;
+
+    espconn_disconnect(pespconn);
+}
+
+/* Called when a client connects to the web config */
+static void ICACHE_FLASH_ATTR web_config_client_connected_cb(void *arg)
+{
+
+    struct espconn *pespconn = (struct espconn *)arg;
+
+    os_printf("web_config_client_connected_cb(): Client connected\r\n");
+
+    if (!check_connection_access(pespconn, config.config_access)) {
+	os_printf("Client disconnected - no config access on this network\r\n");
+	espconn_disconnect(pespconn);
+	return;
+    }
+
+    espconn_regist_disconcb(pespconn,   web_config_client_discon_cb);
+    espconn_regist_recvcb(pespconn,     web_config_client_recv_cb);
+    espconn_regist_sentcb(pespconn,     web_config_client_sent_cb);
+
+    ringbuf_reset(console_rx_buffer);
+    ringbuf_reset(console_tx_buffer);
+
+    if (!config.locked) {
+    //os_printf("config_str: %d\r\n", os_strlen(CONFIG_PAGE));
+	if (page_buf == NULL)
+	    page_buf = (char *)os_malloc(os_strlen(CONFIG_PAGE)+200);
+	os_sprintf(page_buf, CONFIG_PAGE, config.ssid, config.password,
+		   config.ap_ssid, config.ap_password,
+		   config.ap_open?" selected":"", config.ap_open?"":" selected",
+		   IP2STR(&config.network_addr));
+	espconn_sent(pespconn, page_buf, os_strlen(CONFIG_PAGE));
+    }
+    else {
+	espconn_sent(pespconn, LOCK_PAGE, os_strlen(LOCK_PAGE));
+	page_buf = NULL;
+    }
+}
+#endif /* WEB_CONFIG */
+
+
 bool toggle;
 // Timer cb function
 void ICACHE_FLASH_ATTR timer_func(void *arg){
@@ -1533,13 +1875,14 @@ uint32_t Bps;
 #endif
 
     toggle = !toggle;
-#ifdef STATUS_LED_GIPO
-    GPIO_OUTPUT_SET (STATUS_LED_GIPO, toggle && connected);
-#endif
+
+    if (config.status_led <= 16)
+	GPIO_OUTPUT_SET (config.status_led, toggle && connected);
+
     // Power measurement
     // Measure Vdd every second, sliding mean over the last 16 secs
     if (toggle) {
-	Vcurr = readvdd33();
+	Vcurr = (readvdd33()*1000)/1024;
 	Vdd = (Vdd * 15 + Vcurr)/16;
 #ifdef ALLOW_SLEEP
 	if (config.Vmin != 0 && Vdd<config.Vmin) {
@@ -1739,6 +2082,7 @@ struct softap_config apConfig;
    apConfig.ssid_len = 0;// or its actual length
 
    apConfig.max_connection = MAX_CLIENTS; // how many stations can connect to ESP8266 softAP at most.
+   apConfig.ssid_hidden = config.ssid_hidden;
 
    // Set ESP8266 softap config
    wifi_softap_set_config(&apConfig);
@@ -1795,9 +2139,14 @@ void ICACHE_FLASH_ATTR user_set_station_config(void)
     char hostname[40];
 
     /* Setup AP credentials */
-    stationConf.bssid_set = 0;
     os_sprintf(stationConf.ssid, "%s", config.ssid);
     os_sprintf(stationConf.password, "%s", config.password);
+    if (*(int*)config.bssid != 0) {
+	stationConf.bssid_set = 1;
+	os_memcpy(stationConf.bssid, config.bssid, 6);
+    } else {
+	stationConf.bssid_set = 0;
+    }
     wifi_station_set_config(&stationConf);
 
     os_sprintf(hostname, "NET_%s", config.ap_ssid);
@@ -1889,15 +2238,16 @@ struct ip_info info;
     acl_clear_stats(1);
     acl_set_deny_cb(acl_deny_cb);
 #endif
-#ifdef STATUS_LED_GIPO
     // Config GPIO pin as output
-#if (STATUS_LED_GIPO == 1)
-    // Disable output if serial pin is used as status LED
-    system_set_os_print(0);
-#endif
-    easygpio_pinMode(STATUS_LED_GIPO, EASYGPIO_NOPULL, EASYGPIO_OUTPUT);
-    GPIO_OUTPUT_SET (STATUS_LED_GIPO, 0);
-#endif
+    if (config.status_led == 1) {
+	// Disable output if serial pin is used as status LED
+	system_set_os_print(0);
+    }
+
+    if (config.status_led <= 16) {
+	easygpio_pinMode(config.status_led, EASYGPIO_NOPULL, EASYGPIO_OUTPUT);
+	GPIO_OUTPUT_SET (config.status_led, 0);
+    }
 
 #ifdef MQTT_CLIENT
 #ifdef USER_GPIO_IN
@@ -1930,6 +2280,10 @@ struct ip_info info;
 	wifi_set_opmode(STATION_MODE);
     }
 
+#ifdef PHY_MODE
+    wifi_set_phy_mode(config.phy_mode);
+#endif
+
     if (config.my_addr.addr != 0) {
 	wifi_station_dhcpc_stop();
 	info.ip.addr = config.my_addr.addr;
@@ -1941,20 +2295,39 @@ struct ip_info info;
 
 #ifdef REMOTE_CONFIG
     if (config.config_port != 0) {
-      os_printf("Starting Console TCP Server on port %d\r\n", config.config_port);
-      struct espconn *pCon = (struct espconn *)os_zalloc(sizeof(struct espconn));
+	os_printf("Starting Console TCP Server on port %d\r\n", config.config_port);
+	struct espconn *pCon = (struct espconn *)os_zalloc(sizeof(struct espconn));
 
-      /* Equivalent to bind */
-      pCon->type  = ESPCONN_TCP;
-      pCon->state = ESPCONN_NONE;
-      pCon->proto.tcp = (esp_tcp *)os_zalloc(sizeof(esp_tcp));
-      pCon->proto.tcp->local_port = config.config_port;
+	/* Equivalent to bind */
+	pCon->type  = ESPCONN_TCP;
+	pCon->state = ESPCONN_NONE;
+	pCon->proto.tcp = (esp_tcp *)os_zalloc(sizeof(esp_tcp));
+	pCon->proto.tcp->local_port = config.config_port;
 
-      /* Register callback when clients connect to the server */
-      espconn_regist_connectcb(pCon, tcp_client_connected_cb);
+	/* Register callback when clients connect to the server */
+	espconn_regist_connectcb(pCon, tcp_client_connected_cb);
 
-      /* Put the connection in accept mode */
-      espconn_accept(pCon);
+	/* Put the connection in accept mode */
+	espconn_accept(pCon);
+    }
+#endif
+
+#ifdef WEB_CONFIG
+    if (config.web_port != 0) {
+        os_printf("Starting Web Config Server on port %d\r\n", config.web_port);
+        struct espconn *pCon = (struct espconn *)os_zalloc(sizeof(struct espconn));
+
+        /* Equivalent to bind */
+        pCon->type  = ESPCONN_TCP;
+        pCon->state = ESPCONN_NONE;
+        pCon->proto.tcp = (esp_tcp *)os_zalloc(sizeof(esp_tcp));
+        pCon->proto.tcp->local_port = config.web_port;
+
+        /* Register callback when clients connect to the server */
+        espconn_regist_connectcb(pCon, web_config_client_connected_cb);
+
+        /* Put the connection in accept mode */
+        espconn_accept(pCon);
     }
 #endif
 
@@ -1965,6 +2338,7 @@ struct ip_info info;
 #endif
 
 #ifdef MQTT_CLIENT
+    mqtt_connected = false;
     mqtt_enabled = (os_strcmp(config.mqtt_host, "none") != 0);
     if (mqtt_enabled) {
 	MQTT_InitConnection(&mqttClient, config.mqtt_host, config.mqtt_port, 0);

@@ -3,6 +3,9 @@
 
 typedef enum {SIG_DO_NOTHING=0, SIG_START_SERVER=1, SIG_SEND_DATA, SIG_UART0, SIG_CONSOLE_RX, SIG_CONSOLE_TX, SIG_GPIO_INT} USER_SIGNALS;
 
+#define LOCAL_ACCESS 0x01
+#define REMOTE_ACCESS 0x02
+
 #define WIFI_SSID            "ssid"
 #define WIFI_PASSWORD        "password"
 
@@ -35,11 +38,29 @@ typedef enum {SIG_DO_NOTHING=0, SIG_START_SERVER=1, SIG_SEND_DATA, SIG_UART0, SI
 #define ALLOW_SLEEP         1
 
 //
+// Define this to support the setting of the WiFi PHY mode
+//
+#define PHY_MODE	    1
+
+//
 // Define this if you want to have access to the config console via TCP.
 // Ohterwise only local access via serial is possible
 //
 #define REMOTE_CONFIG      1
 #define CONSOLE_SERVER_PORT  7777
+
+//
+// Define this if you want to have access to the config console via TCP.
+// Ohterwise only local access via serial is possible
+//
+#define REMOTE_CONFIG      1
+#define CONSOLE_SERVER_PORT  7777
+
+//
+// Define this if you want to have access to the config via Web.
+//
+#define WEB_CONFIG      1
+#define WEB_CONFIG_PORT 80
 
 //
 // Define this if you want to have ACLs for the SoftAP.
